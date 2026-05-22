@@ -105,6 +105,85 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
 
         return {k: v for k, v in request.items() if k in allowed_keys}
 
+    @staticmethod
+    def _aggregate_sse_response(body_text: str):
+        """Parse a buffered SSE stream into a single ResponsesAPIResponse.
+
+        Some Responses-API backends (notably the ChatGPT subscription/Codex
+        backend) stream per-item payloads via `response.output_item.done`
+        events but ship a `response.completed` event whose `response.output`
+        is empty. Accumulate items from both sources, id-deduped, so the
+        rebuilt response carries the real content.
+
+        Returns (response_or_None, error_message_or_None).
+        """
+        accumulated_output: list = []
+        seen_item_ids: set = set()
+
+        def _append(item: Any) -> None:
+            if not isinstance(item, dict):
+                return
+            item_id = item.get("id")
+            if item_id is not None:
+                if item_id in seen_item_ids:
+                    return
+                seen_item_ids.add(item_id)
+            accumulated_output.append(item)
+
+        completed_response: Optional[ResponsesAPIResponse] = None
+        error_message: Optional[str] = None
+        for chunk in body_text.splitlines():
+            stripped = CustomStreamWrapper._strip_sse_data_from_chunk(chunk)
+            if not stripped:
+                continue
+            stripped = stripped.strip()
+            if not stripped or stripped == STREAM_SSE_DONE_STRING:
+                if stripped == STREAM_SSE_DONE_STRING:
+                    break
+                continue
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            event_type = parsed.get("type")
+            if event_type == ResponsesAPIStreamEvents.OUTPUT_ITEM_DONE:
+                _append(parsed.get("item"))
+                continue
+            if event_type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
+                payload = parsed.get("response")
+                if isinstance(payload, dict):
+                    payload = dict(payload)
+                    if "created_at" in payload:
+                        payload["created_at"] = _safe_convert_created_field(
+                            payload["created_at"]
+                        )
+                    for item in payload.get("output") or []:
+                        _append(item)
+                    payload["output"] = list(accumulated_output)
+                    try:
+                        completed_response = ResponsesAPIResponse(**payload)
+                    except Exception:
+                        completed_response = ResponsesAPIResponse.model_construct(
+                            **payload
+                        )
+                break
+            if event_type in (
+                ResponsesAPIStreamEvents.RESPONSE_FAILED,
+                ResponsesAPIStreamEvents.ERROR,
+            ):
+                error_obj = parsed.get("error") or (parsed.get("response") or {}).get(
+                    "error"
+                )
+                if error_obj is not None:
+                    error_message = (
+                        error_obj.get("message") or str(error_obj)
+                        if isinstance(error_obj, dict)
+                        else str(error_obj)
+                    )
+        return completed_response, error_message
+
     def transform_response_api_response(
         self,
         model: str,
@@ -132,51 +211,7 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             additional_args={"complete_input_dict": {}},
         )
 
-        completed_response = None
-        error_message = None
-        for chunk in body_text.splitlines():
-            stripped_chunk = CustomStreamWrapper._strip_sse_data_from_chunk(chunk)
-            if not stripped_chunk:
-                continue
-            stripped_chunk = stripped_chunk.strip()
-            if not stripped_chunk:
-                continue
-            if stripped_chunk == STREAM_SSE_DONE_STRING:
-                break
-            try:
-                parsed_chunk = json.loads(stripped_chunk)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(parsed_chunk, dict):
-                continue
-            event_type = parsed_chunk.get("type")
-            if event_type == ResponsesAPIStreamEvents.RESPONSE_COMPLETED:
-                response_payload = parsed_chunk.get("response")
-                if isinstance(response_payload, dict):
-                    response_payload = dict(response_payload)
-                    if "created_at" in response_payload:
-                        response_payload["created_at"] = _safe_convert_created_field(
-                            response_payload["created_at"]
-                        )
-                    try:
-                        completed_response = ResponsesAPIResponse(**response_payload)
-                    except Exception:
-                        completed_response = ResponsesAPIResponse.model_construct(
-                            **response_payload
-                        )
-                break
-            if event_type in (
-                ResponsesAPIStreamEvents.RESPONSE_FAILED,
-                ResponsesAPIStreamEvents.ERROR,
-            ):
-                error_obj = parsed_chunk.get("error") or (
-                    parsed_chunk.get("response") or {}
-                ).get("error")
-                if error_obj is not None:
-                    if isinstance(error_obj, dict):
-                        error_message = error_obj.get("message") or str(error_obj)
-                    else:
-                        error_message = str(error_obj)
+        completed_response, error_message = self._aggregate_sse_response(body_text)
 
         if completed_response is None:
             raise OpenAIError(

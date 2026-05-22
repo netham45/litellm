@@ -30,13 +30,14 @@ from litellm.utils import ProviderConfigManager, client
 from ..utils import is_reasoning_auto_summary_enabled
 
 from ..adapters.handler import LiteLLMMessagesToCompletionTransformationHandler
+from ..responses_adapters._signature_codec import _SIG_PREFIX
 from ..responses_adapters.handler import LiteLLMMessagesToResponsesAPIHandler
 from .interceptors import get_messages_interceptors
 from .utils import AnthropicMessagesRequestUtils, mock_response
 
 # Providers that are routed directly to the OpenAI Responses API instead of
 # going through chat/completions.
-_RESPONSES_API_PROVIDERS = frozenset({"openai"})
+_RESPONSES_API_PROVIDERS = frozenset({"openai", "chatgpt"})
 
 
 def _should_route_to_responses_api(custom_llm_provider: Optional[str]) -> bool:
@@ -44,8 +45,14 @@ def _should_route_to_responses_api(custom_llm_provider: Optional[str]) -> bool:
 
     Set ``litellm.use_chat_completions_url_for_anthropic_messages = True`` to
     opt out and route OpenAI/Azure requests through chat/completions instead.
+    Whitelisted providers (openai, chatgpt) still get Responses routing even
+    when that flag is set, since they require the Responses API to round-trip
+    reasoning.encrypted_content.
     """
-    if litellm.use_chat_completions_url_for_anthropic_messages:
+    if (
+        litellm.use_chat_completions_url_for_anthropic_messages
+        and custom_llm_provider not in _RESPONSES_API_PROVIDERS
+    ):
         return False
     return custom_llm_provider in _RESPONSES_API_PROVIDERS
 
@@ -238,6 +245,30 @@ async def anthropic_messages(
     request_kwargs.pop("litellm_params", None)
     # Merge back any other modifications
     kwargs.update(request_kwargs)
+
+    # Strip foreign packed signatures from history when routing to native
+    # Anthropic. The responses_adapters packs `{id, encrypted_content}` from
+    # OpenAI Responses reasoning items into the thinking block's `signature`
+    # field. Anthropic rejects these with `Invalid signature in thinking
+    # block` when the conversation later switches to a native Anthropic model
+    # (e.g. via /model). The text in these thinking blocks is empty (Claude
+    # Code's clear_thinking edit clears it), so the cleanest fix is to drop
+    # them entirely.
+    if custom_llm_provider == "anthropic" and isinstance(messages, list):
+        for _m in messages:
+            _content = _m.get("content") if isinstance(_m, dict) else None
+            if not isinstance(_content, list):
+                continue
+            _m["content"] = [
+                _c
+                for _c in _content
+                if not (
+                    isinstance(_c, dict)
+                    and _c.get("type") == "thinking"
+                    and isinstance(_c.get("signature"), str)
+                    and _c["signature"].startswith(_SIG_PREFIX)
+                )
+            ]
 
     # Short-circuit web-search-only requests: detect the pattern, execute
     # search directly via Tavily/Perplexity, and return a synthetic response

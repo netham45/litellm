@@ -201,3 +201,129 @@ class TestChatGPTResponsesAPITransformation:
         )
 
         assert parsed.output_text == "Hello!"
+
+    def test_chatgpt_aggregates_output_item_done_events(self):
+        """
+        Reproduces the chatgpt subscription/Codex bug where the upstream
+        `response.completed` event carries an empty `output` array even though
+        the actual answer arrived earlier via `response.output_item.done`.
+        The provider should accumulate those items so the buffered response is
+        not empty.
+        """
+        config = ChatGPTResponsesAPIConfig()
+        reasoning_item = {
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": [{"type": "summary_text", "text": "thought"}],
+            "encrypted_content": "enc-abc",
+        }
+        message_item = {
+            "id": "msg_1",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "output_text",
+                    "annotations": [],
+                    "logprobs": [],
+                    "text": "Hi there friend.",
+                }
+            ],
+        }
+        completed_payload = {
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": "gpt-5.3-codex",
+            # Bug-shaped event: empty output even though items were streamed.
+            "output": [],
+        }
+        sse_body = "\n".join(
+            [
+                f"data: {json.dumps({'type': 'response.output_item.done', 'item': reasoning_item, 'output_index': 0, 'sequence_number': 1})}",
+                f"data: {json.dumps({'type': 'response.output_item.done', 'item': message_item, 'output_index': 1, 'sequence_number': 2})}",
+                f"data: {json.dumps({'type': 'response.completed', 'response': completed_payload})}",
+                "data: [DONE]",
+                "",
+            ]
+        )
+        raw_response = httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=sse_body
+        )
+        logging_obj = MagicMock()
+
+        parsed = config.transform_response_api_response(
+            model="chatgpt/gpt-5.3-codex",
+            raw_response=raw_response,
+            logging_obj=logging_obj,
+        )
+
+        def _attr(item, name):
+            if isinstance(item, dict):
+                return item.get(name)
+            return getattr(item, name, None)
+
+        assert len(parsed.output) == 2
+        # Order preserved: reasoning first, then assistant message.
+        assert _attr(parsed.output[0], "type") == "reasoning"
+        assert _attr(parsed.output[0], "encrypted_content") == "enc-abc"
+        assert _attr(parsed.output[1], "type") == "message"
+        assert parsed.output_text == "Hi there friend."
+
+    def test_chatgpt_unions_output_item_done_with_response_completed(self):
+        """
+        When response.completed DOES carry output items, union with the
+        accumulated set (no duplicates by id) rather than overwriting.
+        """
+        config = ChatGPTResponsesAPIConfig()
+        message_item = {
+            "id": "msg_1",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "hello"}],
+        }
+        extra_item = {
+            "id": "msg_2",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "bonus"}],
+        }
+        completed_payload = {
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": "gpt-5.3-codex",
+            # response.completed also includes msg_1 (duplicate) and msg_2 (new).
+            "output": [message_item, extra_item],
+        }
+        sse_body = "\n".join(
+            [
+                f"data: {json.dumps({'type': 'response.output_item.done', 'item': message_item, 'output_index': 0, 'sequence_number': 1})}",
+                f"data: {json.dumps({'type': 'response.completed', 'response': completed_payload})}",
+                "data: [DONE]",
+                "",
+            ]
+        )
+        raw_response = httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=sse_body
+        )
+        logging_obj = MagicMock()
+
+        parsed = config.transform_response_api_response(
+            model="chatgpt/gpt-5.3-codex",
+            raw_response=raw_response,
+            logging_obj=logging_obj,
+        )
+
+        def _id(item):
+            if isinstance(item, dict):
+                return item.get("id")
+            return getattr(item, "id", None)
+
+        ids = [_id(item) for item in parsed.output]
+        assert ids == ["msg_1", "msg_2"]
