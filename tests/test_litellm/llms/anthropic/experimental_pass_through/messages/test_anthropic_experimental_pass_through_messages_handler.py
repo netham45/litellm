@@ -544,3 +544,83 @@ class TestThinkingSummaryPreservation:
         assert result == {
             "reasoning_effort": {"effort": "medium", "summary": "concise"}
         }
+
+
+class TestForceThinkingInjection:
+    """Tests for server-side `force_thinking` injection via model_info aliases."""
+
+    @pytest.mark.asyncio
+    async def test_force_thinking_injected_when_client_omits_thinking(self):
+        """When model_info.force_thinking is set and client did not send thinking,
+        the handler should splice it into the request before downstream routing."""
+        from litellm.llms.anthropic.experimental_pass_through.messages import handler
+
+        force = {"type": "enabled", "budget_tokens": 12345}
+        captured = {}
+
+        def fake_handler(**kw):
+            captured.update(kw)
+            return "test-response"
+
+        with patch.object(
+            handler, "anthropic_messages_handler", side_effect=fake_handler
+        ):
+            await handler.anthropic_messages(
+                max_tokens=100,
+                messages=[{"role": "user", "content": "hi"}],
+                model="anthropic/claude-opus-4-7",
+                custom_llm_provider="anthropic",
+                model_info={"force_thinking": force},
+            )
+        assert captured.get("thinking") == force
+
+    @pytest.mark.asyncio
+    async def test_force_thinking_does_not_override_client_thinking(self):
+        """If the client explicitly sets thinking (even type=disabled), the
+        force_thinking value in model_info must NOT overwrite it."""
+        from litellm.llms.anthropic.experimental_pass_through.messages import handler
+
+        client_thinking = {"type": "disabled"}
+        force = {"type": "enabled", "budget_tokens": 99999}
+        captured = {}
+
+        def fake_handler(**kw):
+            captured.update(kw)
+            return "test-response"
+
+        with patch.object(
+            handler, "anthropic_messages_handler", side_effect=fake_handler
+        ):
+            await handler.anthropic_messages(
+                max_tokens=100,
+                messages=[{"role": "user", "content": "hi"}],
+                model="anthropic/claude-opus-4-7",
+                custom_llm_provider="anthropic",
+                thinking=client_thinking,
+                model_info={"force_thinking": force},
+            )
+        assert captured.get("thinking") == client_thinking
+
+    @pytest.mark.asyncio
+    async def test_no_force_thinking_no_change(self):
+        """No force_thinking in model_info → thinking remains whatever client sent (None)."""
+        from litellm.llms.anthropic.experimental_pass_through.messages import handler
+
+        captured = {}
+
+        def fake_handler(**kw):
+            captured.update(kw)
+            return "test-response"
+
+        with patch.object(
+            handler, "anthropic_messages_handler", side_effect=fake_handler
+        ):
+            await handler.anthropic_messages(
+                max_tokens=100,
+                messages=[{"role": "user", "content": "hi"}],
+                model="anthropic/claude-opus-4-7",
+                custom_llm_provider="anthropic",
+                model_info={"some_other_key": "value"},
+            )
+        # Was None on input, stays None / falsy.
+        assert not captured.get("thinking")

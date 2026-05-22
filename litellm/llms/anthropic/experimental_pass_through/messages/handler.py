@@ -239,6 +239,21 @@ async def anthropic_messages(
     # Merge back any other modifications
     kwargs.update(request_kwargs)
 
+    # force_thinking injection: if the deployment's model_info specifies a
+    # force_thinking dict and the client did NOT supply a `thinking` field,
+    # splice it in here, BEFORE any provider-specific translation runs.
+    # This lets server-side aliases (e.g. opus-thinking, sonnet-thinking,
+    # haiku-thinking) inject a thinking config that Claude Code's Agent tool
+    # schema (opus|sonnet|haiku only) can't otherwise specify. The router
+    # places the deployment's model_info dict into kwargs (router.py).
+    # Respect explicit client choice — including {"type":"disabled"}.
+    if not thinking:
+        _mi = kwargs.get("model_info") or {}
+        if isinstance(_mi, dict):
+            _ft = _mi.get("force_thinking")
+            if isinstance(_ft, dict) and _ft:
+                thinking = _ft
+
     # Short-circuit web-search-only requests: detect the pattern, execute
     # search directly via Tavily/Perplexity, and return a synthetic response
     # without ever touching the backend LLM or the adapter path.
